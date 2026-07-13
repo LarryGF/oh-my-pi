@@ -15,6 +15,14 @@
 ### Added
 
 - Added a configurable per-request timeout for the `inspect_image` tool (`inspect_image.timeoutMs`, default 5 minutes; set to 0 to disable) so a stalled vision-model provider fails fast with a clear error instead of blocking until manual abort ([#4165](https://github.com/can1357/oh-my-pi/issues/4165)).
+- Added `--downshift` / `--downshift-into <model>` / `--no-downshift`: start on a strong model, then hand off to a fast/cheap one (default the `smol` role) at the first edit/write tool call *after* the todo list has been initialized. The starting model handles all planning and todo initialization, and begins implementation, before handing off; the fast model includes a verify checklist before finishing. Enable per-user with the `downshift.enabled` setting; force it mid-session with the new `/downshift` slash command, which arms the switch.
+- Added display setting to toggle between collapsing or keeping compacted history inline, now applied to live session displays
+- Added a compact session-only model picker (Alt+P) for quick model switching without changing roles
+- Added `@` search to the Alt+P / `/switch` picker: it lists configured Ctrl+P quick roles in matching segment colors and applies the selected role's model and thinking for the current session.
+- Redesigned Agent Hub entries as two-line cards: identity (status glyph, name, agent type, parent when nested) on the left, active model + reasoning level and age right-aligned, with the task description on its own line; dropped the redundant `sub · of Main` noise
+- Added a project-scoped `launch` tool for shared long-running services and debuggers, with readiness probes, bounded logs, PTY input, restart policies, and automatic teardown after the last omp instance exits. Gated behind the `launch.enabled` setting (default on); when disabled the tool is withdrawn and the bash prompt drops its "use launch" guidance.
+- Added `detached` `launch` starts for standalone services that survive every omp instance and broker shutdown, then reconnect to the next broker for logs and explicit stop.
+- Added `/commit`, a fast in-session commit workflow with configurable main-branch protection, whole-file split planning, commit-message formatting, and feature-branch templates.
 
 ### Changed
 
