@@ -12,17 +12,17 @@ import {
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { loadCustomCommands } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/loader";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
-import { $ } from "bun";
 
 let repoDir: string;
 
 beforeEach(async () => {
 	repoDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-quick-commit-"));
-	await $`git init --initial-branch=main`.cwd(repoDir).quiet();
-	await $`git config user.email tester@example.com`.cwd(repoDir).quiet();
-	await $`git config user.name Tester`.cwd(repoDir).quiet();
+	await git.repo.init(repoDir, { initialBranch: "main" });
+	await git.config.set(repoDir, "user.email", "tester@example.com");
+	await git.config.set(repoDir, "user.name", "Tester");
 	await Bun.write(path.join(repoDir, "baseline.txt"), "baseline\n");
-	await $`git add -A && git commit -m baseline`.cwd(repoDir).quiet();
+	await git.stage.files(repoDir);
+	await git.commit(repoDir, "baseline");
 });
 
 afterEach(async () => {
@@ -61,6 +61,102 @@ describe("quick commit split execution", () => {
 			"- Document how to enable the feature flag.",
 		);
 		expect(await git.status(repoDir)).toBe("");
+	});
+
+	it("commits only the staged snapshot when a split file also has unstaged hunks", async () => {
+		await Bun.write(path.join(repoDir, "tracked.txt"), "one\n");
+		await git.stage.files(repoDir);
+		await git.commit(repoDir, "chore: seed tracked file");
+
+		await Bun.write(path.join(repoDir, "tracked.txt"), "one\ntwo\n");
+		await Bun.write(path.join(repoDir, "docs.md"), "# Feature\n");
+		await git.stage.files(repoDir);
+		// Left unstaged on purpose: the split executor must not fold this in.
+		await Bun.write(path.join(repoDir, "tracked.txt"), "one\ntwo\nthree\n");
+
+		const plan: QuickCommitPlan = {
+			commits: [
+				{
+					files: ["tracked.txt"],
+					message: "feat: extend tracked file\n\n- Add the staged line.",
+					body: "- Add the staged line.",
+					branchType: "feat",
+					branchScope: null,
+				},
+				{
+					files: ["docs.md"],
+					message: "docs: document the feature\n\n- Document the feature.",
+					body: "- Document the feature.",
+					branchType: "docs",
+					branchScope: null,
+				},
+			],
+		};
+
+		await createSplitCommits(repoDir, plan);
+
+		expect(await git.log.subjects(repoDir, 2)).toEqual(["docs: document the feature", "feat: extend tracked file"]);
+		// Everything committed matches the staged snapshot, so the only remaining
+		// difference between HEAD and the working tree is the never-staged hunk.
+		const residual = await git.diff(repoDir);
+		expect(residual).toContain("+three");
+		expect(residual).not.toContain("+two");
+		expect(await git.diff.changedFiles(repoDir, { cached: true })).toEqual([]);
+	});
+
+	it("preserves a staged rename across split commits", async () => {
+		await Bun.write(path.join(repoDir, "old.txt"), "alpha\nbeta\ngamma\n");
+		await git.stage.files(repoDir);
+		await git.commit(repoDir, "chore: seed renamed file");
+
+		await fs.rename(path.join(repoDir, "old.txt"), path.join(repoDir, "new.txt"));
+		await Bun.write(path.join(repoDir, "docs.md"), "# Feature\n");
+		await git.stage.files(repoDir);
+		expect(await git.diff.changedFiles(repoDir, { cached: true })).toEqual(["docs.md", "new.txt"]);
+
+		const plan: QuickCommitPlan = {
+			commits: [
+				{
+					files: ["new.txt"],
+					message: "refactor: rename the file\n\n- Rename old.txt to new.txt.",
+					body: "- Rename old.txt to new.txt.",
+					branchType: "refactor",
+					branchScope: null,
+				},
+				{
+					files: ["docs.md"],
+					message: "docs: document the rename\n\n- Document the rename.",
+					body: "- Document the rename.",
+					branchType: "docs",
+					branchScope: null,
+				},
+			],
+		};
+
+		await createSplitCommits(repoDir, plan);
+
+		const tracked = await git.ls.tree(repoDir, "HEAD");
+		expect(tracked).toContain("new.txt");
+		expect(tracked).not.toContain("old.txt");
+		expect(await git.status(repoDir)).toBe("");
+	});
+
+	it("rejects a nonconventional subject whose body contains a conventional line", () => {
+		const buriedPrefix: QuickCommitPlan = {
+			commits: [
+				{
+					files: ["feature.ts"],
+					message: "release the thing\n\nfeat: buried in body",
+					body: "feat: buried in body",
+					branchType: "feat",
+					branchScope: null,
+				},
+			],
+		};
+		expect(() => validateQuickCommitPlan(buriedPrefix, ["feature.ts"], "auto", "conventional")).toThrow(
+			"Commit message is not conventional: release the thing",
+		);
+		expect(() => validateQuickCommitPlan(buriedPrefix, ["feature.ts"], "auto", "freeform")).not.toThrow();
 	});
 
 	it("rejects plans that duplicate or omit staged files before execution", () => {

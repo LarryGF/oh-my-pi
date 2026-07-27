@@ -2252,6 +2252,18 @@ export const head = {
 // ════════════════════════════════════════════════════════════════════════════
 
 export const repo = {
+	/** Initialize a new repository at `cwd` (`git init`). */
+	async init(
+		cwd: string,
+		options: { initialBranch?: string; bare?: boolean; refFormat?: string; signal?: AbortSignal } = {},
+	): Promise<void> {
+		const args = ["init"];
+		if (options.initialBranch) args.push(`--initial-branch=${options.initialBranch}`);
+		if (options.bare) args.push("--bare");
+		if (options.refFormat) args.push(`--ref-format=${options.refFormat}`);
+		await runEffect(cwd, args, { signal: options.signal });
+	},
+
 	/** Resolve the repository root (may be a worktree root). */
 	async root(cwd: string, signal?: AbortSignal): Promise<string | null> {
 		const repository = await resolveRepository(cwd);

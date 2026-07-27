@@ -83,13 +83,19 @@ function parseQuickCommitPlan(message: AssistantMessage): QuickCommitPlan {
 	if (!toolCall) throw new Error("Commit planner did not return a commit plan.");
 	const parsed = validateToolCall([QuickCommitPlanTool], toolCall) as typeof quickCommitPlanSchema.infer;
 	return {
-		commits: parsed.commits.map(commit => ({
-			files: commit.files,
-			message: formatQuickCommitMessage(commit.subject, commit.body),
-			body: commit.body.trim(),
-			branchType: commit.branch_type.trim(),
-			branchScope: commit.branch_scope?.trim() || null,
-		})),
+		commits: parsed.commits.map(commit => {
+			const subject = commit.subject.trim();
+			if (/[\r\n]/.test(subject)) {
+				throw new Error(`Commit planner returned a multiline commit subject: ${subject.split("\n", 1)[0]}`);
+			}
+			return {
+				files: commit.files,
+				message: formatQuickCommitMessage(subject, commit.body),
+				body: commit.body.trim(),
+				branchType: commit.branch_type.trim(),
+				branchScope: commit.branch_scope?.trim() || null,
+			};
+		}),
 	};
 }
 

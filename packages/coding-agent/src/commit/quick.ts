@@ -8,8 +8,10 @@ export type { QuickCommitPlan } from "./quick-planner";
 
 const RECENT_COMMITS_COUNT = 8;
 const MAX_DIFF_CHARS = 120_000;
-const CONVENTIONAL_MESSAGE =
-	/^(feat|fix|refactor|docs|test|chore|style|perf|build|ci|revert)(\([a-z0-9_-]+(?:\/[a-z0-9_-]+)?\))?!?:\s\S/m;
+// Anchored without `m`: only the subject line is validated, so a conventional
+// prefix buried in the commit body can never satisfy `messageFormat=conventional`.
+const CONVENTIONAL_SUBJECT =
+	/^(feat|fix|refactor|docs|test|chore|style|perf|build|ci|revert)(\([a-z0-9_-]+(?:\/[a-z0-9_-]+)?\))?!?:\s\S/;
 
 export interface QuickCommitResult {
 	commitCount: number;
@@ -136,8 +138,9 @@ export function validateQuickCommitPlan(
 		if (!commit.message) throw new Error("Commit planner returned an empty commit message.");
 		if (!commit.body) throw new Error("Commit planner returned an empty commit body.");
 		if (!commit.branchType) throw new Error("Commit planner returned an empty branch type.");
-		if (messageFormat === "conventional" && !CONVENTIONAL_MESSAGE.test(commit.message)) {
-			throw new Error(`Commit message is not conventional: ${commit.message.split("\n", 1)[0]}`);
+		const subject = commit.message.split("\n", 1)[0];
+		if (messageFormat === "conventional" && !CONVENTIONAL_SUBJECT.test(subject)) {
+			throw new Error(`Commit message is not conventional: ${subject}`);
 		}
 		for (const file of commit.files) {
 			if (!staged.has(file)) throw new Error(`Commit planner included a file that is not staged: ${file}`);
@@ -214,10 +217,21 @@ function normalizeBranchSegment(value: string): string {
 	return normalized;
 }
 
+/**
+ * Rebuild each commit from the staged snapshot captured before the index is
+ * reset — never from the working tree. Re-`git add`ing a path would fold in
+ * unstaged hunks the user deliberately left out and degrade a staged rename
+ * into an addition that leaves the old path tracked-and-deleted.
+ */
 export async function createSplitCommits(cwd: string, plan: QuickCommitPlan): Promise<void> {
+	const stagedDiff = await git.diff(cwd, { cached: true, binary: true });
 	await git.stage.reset(cwd);
 	for (const commit of plan.commits) {
-		await git.stage.files(cwd, commit.files);
+		await git.stage.hunks(
+			cwd,
+			commit.files.map(file => ({ path: file, hunks: { type: "all" } as const })),
+			{ rawDiff: stagedDiff, diffCached: true },
+		);
 		await git.commit(cwd, commit.message);
 		await git.stage.reset(cwd);
 	}
