@@ -162,7 +162,7 @@ function loadBundledCommands(sharedApi: CustomCommandAPI): LoadedCustomCommand[]
 	bundled.push({
 		path: "bundled:commit",
 		resolvedPath: "bundled:commit",
-		command: new SessionCommitCommand(sharedApi),
+		command: new SessionCommitCommand(),
 		source: "bundled",
 	});
 	bundled.push({

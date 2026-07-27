@@ -140,6 +140,124 @@ describe("quick commit split execution", () => {
 		expect(tracked).not.toContain("old.txt");
 		expect(await git.status(repoDir)).toBe("");
 	});
+	it("stages and commits a non-ASCII filename across split commits", async () => {
+		// Git C-quotes any path with non-ASCII bytes in both `--name-only`
+		// listings and `diff --git a/... b/...` headers unless
+		// core.quotepath=false; the header parser used to key diffs by the
+		// literal `a/`/`b/` prefix and silently dropped the quoted section.
+		await Bun.write(path.join(repoDir, "café.txt"), "bonjour\n");
+		await Bun.write(path.join(repoDir, "docs.md"), "# Feature\n");
+		await git.stage.files(repoDir);
+		expect(await git.diff.changedFiles(repoDir, { cached: true })).toEqual(["café.txt", "docs.md"]);
+
+		const plan: QuickCommitPlan = {
+			commits: [
+				{
+					files: ["café.txt"],
+					message: "feat: add café greeting\n\n- Add the greeting file.",
+					body: "- Add the greeting file.",
+					branchType: "feat",
+					branchScope: null,
+				},
+				{
+					files: ["docs.md"],
+					message: "docs: document the feature\n\n- Document the feature.",
+					body: "- Document the feature.",
+					branchType: "docs",
+					branchScope: null,
+				},
+			],
+		};
+
+		await createSplitCommits(repoDir, plan);
+
+		expect(await git.log.subjects(repoDir, 2)).toEqual(["docs: document the feature", "feat: add café greeting"]);
+		expect(await git.ls.tree(repoDir, "HEAD")).toContain("café.txt");
+		expect(await git.status(repoDir)).toBe("");
+	});
+
+	it("restores the staged snapshot for commits that haven't landed when a later group fails", async () => {
+		await fs.mkdir(path.join(repoDir, ".git", "hooks"), { recursive: true });
+		// Reject any commit that stages `blocked.txt`, simulating a pre-commit
+		// hook or signing failure partway through a multi-commit split.
+		await Bun.write(
+			path.join(repoDir, ".git", "hooks", "pre-commit"),
+			"#!/bin/sh\ngit diff --cached --name-only | grep -q blocked.txt && exit 1\nexit 0\n",
+		);
+		await fs.chmod(path.join(repoDir, ".git", "hooks", "pre-commit"), 0o755);
+
+		await Bun.write(path.join(repoDir, "ok.txt"), "fine\n");
+		await Bun.write(path.join(repoDir, "blocked.txt"), "nope\n");
+		await Bun.write(path.join(repoDir, "later.txt"), "later\n");
+		await git.stage.files(repoDir);
+
+		const plan: QuickCommitPlan = {
+			commits: [
+				{
+					files: ["ok.txt"],
+					message: "feat: add ok file\n\n- Add ok.txt.",
+					body: "- Add ok.txt.",
+					branchType: "feat",
+					branchScope: null,
+				},
+				{
+					files: ["blocked.txt"],
+					message: "feat: add blocked file\n\n- Add blocked.txt.",
+					body: "- Add blocked.txt.",
+					branchType: "feat",
+					branchScope: null,
+				},
+				{
+					files: ["later.txt"],
+					message: "feat: add later file\n\n- Add later.txt.",
+					body: "- Add later.txt.",
+					branchType: "feat",
+					branchScope: null,
+				},
+			],
+		};
+
+		await expect(createSplitCommits(repoDir, plan)).rejects.toThrow();
+
+		// The first group committed successfully; the failed group and every
+		// group after it must be restaged (not left invisible in the working
+		// tree) so a retry sees the original staged snapshot.
+		expect(await git.log.subjects(repoDir, 1)).toEqual(["feat: add ok file"]);
+		expect(await git.diff.changedFiles(repoDir, { cached: true })).toEqual(["blocked.txt", "later.txt"]);
+	});
+	it("decodes a forced-quoted diff header (embedded tab alongside Unicode text)", () => {
+		// core.quotepath=false only suppresses quoting for non-ASCII bytes; a
+		// literal tab still forces Git to C-quote the whole header. This must
+		// decode the mixed run correctly, not reinterpret the already-decoded
+		// Unicode character as a single raw byte.
+		const rawDiff = [
+			'diff --git "a/café\\tmixed.txt" "b/café\\tmixed.txt"',
+			"new file mode 100644",
+			"index 0000000..1234567",
+			"--- /dev/null",
+			'+++ "b/café\\tmixed.txt"',
+			"@@ -0,0 +1 @@",
+			"+hello",
+			"",
+		].join("\n");
+
+		expect(git.diff.parseFiles(rawDiff)[0]?.filename).toBe("café\tmixed.txt");
+	});
+
+	it("decodes a diff header quoted purely by octal-escaped non-ASCII bytes", () => {
+		const rawDiff = [
+			'diff --git "a/caf\\303\\251.txt" "b/caf\\303\\251.txt"',
+			"new file mode 100644",
+			"index 0000000..1234567",
+			"--- /dev/null",
+			'+++ "b/caf\\303\\251.txt"',
+			"@@ -0,0 +1 @@",
+			"+hello",
+			"",
+		].join("\n");
+
+		expect(git.diff.parseFiles(rawDiff)[0]?.filename).toBe("café.txt");
+	});
 
 	it("rejects a nonconventional subject whose body contains a conventional line", () => {
 		const buriedPrefix: QuickCommitPlan = {
@@ -157,6 +275,20 @@ describe("quick commit split execution", () => {
 			"Commit message is not conventional: release the thing",
 		);
 		expect(() => validateQuickCommitPlan(buriedPrefix, ["feature.ts"], "auto", "freeform")).not.toThrow();
+	});
+	it("accepts a conventional subject with a comma-separated multi-package scope", () => {
+		const multiScope: QuickCommitPlan = {
+			commits: [
+				{
+					files: ["feature.ts"],
+					message: "feat(catalog,ai): add SiliconFlow providers\n\n- Add dynamic-only discovery.",
+					body: "- Add dynamic-only discovery.",
+					branchType: "feat",
+					branchScope: "catalog,ai",
+				},
+			],
+		};
+		expect(() => validateQuickCommitPlan(multiScope, ["feature.ts"], "auto", "conventional")).not.toThrow();
 	});
 
 	it("rejects plans that duplicate or omit staged files before execution", () => {
@@ -217,6 +349,15 @@ describe("quick commit repository resolution", () => {
 		await fs.mkdir(nestedDir, { recursive: true });
 
 		expect(await resolveQuickCommitCwd(nestedDir)).toBe(repoDir);
+	});
+	it("returns no history for a freshly initialized repo instead of throwing", async () => {
+		const freshDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-quick-commit-fresh-"));
+		try {
+			await git.repo.init(freshDir, { initialBranch: "main" });
+			expect(await git.log.subjects(freshDir, 8)).toEqual([]);
+		} finally {
+			await fs.rm(freshDir, { recursive: true, force: true });
+		}
 	});
 });
 

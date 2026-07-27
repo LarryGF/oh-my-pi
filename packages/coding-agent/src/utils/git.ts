@@ -65,6 +65,7 @@ export interface DiffOptions {
 	readonly numstat?: boolean;
 	readonly signal?: AbortSignal;
 	readonly stat?: boolean;
+	readonly z?: boolean;
 }
 
 export interface StatusOptions {
@@ -183,6 +184,13 @@ const DEFAULT_BRANCH_REFS = ["refs/remotes/origin/HEAD", "refs/remotes/upstream/
 const SHORT_LIVED_GIT_CONFIG: readonly (readonly [key: string, value: string])[] = [
 	["core.fsmonitor", "false"],
 	["core.untrackedCache", "false"],
+	// Without this, Git C-quotes any path containing non-ASCII bytes (e.g.
+	// "café.txt" -> "caf\303\251.txt") in both `--name-only` listings and
+	// `diff --git a/... b/...` headers. `parseFileDiffs`'s header regex keys
+	// diffs by the literal `a/`/`b/` prefix and cannot match the quoted form,
+	// silently dropping the file's section — split-commit staging then fails
+	// to find a diff for a validly staged, non-ASCII-named file.
+	["core.quotepath", "false"],
 ];
 const AMBIENT_GIT_ENV = {
 	GIT_DIR: undefined,
@@ -575,7 +583,10 @@ function buildDiffArgs(options: DiffOptions): string[] {
 	const args = ["diff"];
 	if (options.binary) args.push("--binary");
 	if (options.cached) args.push("--cached");
-	if (options.nameOnly) args.push("--name-only");
+	if (options.nameOnly) {
+		args.push("--name-only");
+		if (options.z) args.push("-z");
+	}
 	if (options.stat) args.push("--stat");
 	if (options.numstat) args.push("--numstat");
 	if (options.noIndex) {
@@ -1198,7 +1209,11 @@ export const diff = Object.assign(
 			cwd: string,
 			options: Pick<DiffOptions, "cached" | "files" | "signal"> = {},
 		): Promise<string[]> {
-			return splitLines(await diff(cwd, { ...options, nameOnly: true }));
+			// `-z` sidesteps Git's C-quoting entirely (NUL-delimited raw bytes),
+			// keeping this in sync with `parseFileDiffs`'s unquoted filenames
+			// instead of quoted text that would never match them.
+			const output = await diff(cwd, { ...options, nameOnly: true, z: true });
+			return output.split("\0").filter(Boolean);
 		},
 		/** Parsed per-file add/remove counts. */
 		async numstat(cwd: string, options: Pick<DiffOptions, "cached" | "signal"> = {}): Promise<NumstatEntry[]> {
@@ -1668,7 +1683,19 @@ export async function commitDetails(cwd: string, revision: string, signal?: Abor
 export const log = {
 	/** Recent commit subjects (one-line each). */
 	async subjects(cwd: string, count: number, signal?: AbortSignal): Promise<string[]> {
-		return splitLines(await runText(cwd, ["log", `-n${count}`, "--pretty=format:%s"], { readOnly: true, signal }));
+		// A freshly initialized repo has no commits yet ("unborn HEAD"); `git log`
+		// exits 128 with "does not have any commits yet" rather than an empty
+		// list. That's the normal state for a repo's first commit, so treat only
+		// that specific failure as "no history" — other failures (corrupt repo,
+		// permissions, abort) still propagate instead of being swallowed.
+		ensureAvailable();
+		const args = ["log", `-n${count}`, "--pretty=format:%s"];
+		const result = await git(cwd, args, { readOnly: true, signal });
+		if (result.exitCode !== 0) {
+			if (/does not have any commits yet/.test(result.stderr)) return [];
+			throw new GitCommandError(args, result);
+		}
+		return splitLines(result.stdout);
 	},
 	/** Recent commits as `<short-sha> <subject>` onelines. */
 	async onelines(cwd: string, count: number, signal?: AbortSignal): Promise<string[]> {

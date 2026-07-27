@@ -52,6 +52,33 @@ export interface GenerateQuickCommitPlanInput {
 	diff: string;
 }
 
+const MIN_PLAN_OUTPUT_TOKENS = 2000;
+const MAX_PLAN_OUTPUT_TOKENS = 8000;
+// Headroom for subjects/bodies/branch metadata across all commits, on top of
+// the file-list echo below.
+const PLAN_CONTENT_TOKENS = 1200;
+
+/**
+ * The schema requires every staged path to appear in exactly one commit's
+ * `files` array, so worst case the tool call echoes the complete staged file
+ * list once (plus JSON quoting/array overhead) before a single subject or
+ * body byte. A fixed 2000-token budget truncates the tool call for large
+ * staged sets (bulk renames, generated-file updates) well before content is
+ * actually the bottleneck. Only `input.files` is known at request time — the
+ * plan (and its commit count) is the model's *output*, not an input here.
+ */
+function estimatePlanOutputTokens(files: readonly string[]): number {
+	const pathChars = files.reduce((sum, file) => sum + file.length + 4, 0); // + quotes/comma overhead
+	const pathTokens = Math.ceil(pathChars / 3.5); // conservative chars-per-token for path-like text
+	const required = pathTokens + PLAN_CONTENT_TOKENS;
+	if (required > MAX_PLAN_OUTPUT_TOKENS) {
+		throw new Error(
+			`Staged file list is too large for a single commit plan (${files.length} files, ~${required} output tokens needed, cap is ${MAX_PLAN_OUTPUT_TOKENS}). Commit in smaller batches.`,
+		);
+	}
+	return Math.max(MIN_PLAN_OUTPUT_TOKENS, required);
+}
+
 export async function generateQuickCommitPlan(input: GenerateQuickCommitPlanInput): Promise<QuickCommitPlan> {
 	const systemPrompt = prompt.render(quickSystemPrompt, {
 		split_mode: input.splitMode,
@@ -73,7 +100,11 @@ export async function generateQuickCommitPlan(input: GenerateQuickCommitPlanInpu
 			messages: [{ role: "user", content: userPrompt, timestamp: Date.now() }],
 			tools: [QuickCommitPlanTool],
 		},
-		{ apiKey: input.apiKey, maxTokens: 2000, reasoning: toReasoningEffort(input.thinkingLevel) },
+		{
+			apiKey: input.apiKey,
+			maxTokens: estimatePlanOutputTokens(input.files),
+			reasoning: toReasoningEffort(input.thinkingLevel),
+		},
 	);
 	return parseQuickCommitPlan(response);
 }

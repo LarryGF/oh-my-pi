@@ -1,5 +1,6 @@
 import type { Settings } from "../config/settings";
 import type { HookCommandContext } from "../extensibility/hooks/types";
+import { PREVIEW_LIMITS, previewLine, replaceTabs, TRUNCATE_LENGTHS } from "../tools/render-utils";
 import * as git from "../utils/git";
 import { resolvePrimaryModel } from "./model-selection";
 import { generateQuickCommitPlan, type QuickCommitPlan, type QuickCommitPlanItem } from "./quick-planner";
@@ -11,7 +12,7 @@ const MAX_DIFF_CHARS = 120_000;
 // Anchored without `m`: only the subject line is validated, so a conventional
 // prefix buried in the commit body can never satisfy `messageFormat=conventional`.
 const CONVENTIONAL_SUBJECT =
-	/^(feat|fix|refactor|docs|test|chore|style|perf|build|ci|revert)(\([a-z0-9_-]+(?:\/[a-z0-9_-]+)?\))?!?:\s\S/;
+	/^(feat|fix|refactor|docs|test|chore|style|perf|build|ci|revert)(\([a-z0-9_-]+(?:\/[a-z0-9_-]+)?(?:,[a-z0-9_-]+(?:\/[a-z0-9_-]+)?)*\))?!?:\s\S/;
 
 export interface QuickCommitResult {
 	commitCount: number;
@@ -92,6 +93,21 @@ export async function runQuickCommit(
 			await git.branch.checkoutNew(cwd, branch.name);
 		} else {
 			await git.checkout(cwd, branch.name);
+			// Switching to an *existing* branch can drop a staged path out of the
+			// index without error: if that branch's tree already matches the
+			// staged content for a path, the index-vs-HEAD diff for it becomes
+			// empty and the path vanishes from `changedFiles`. Fail loudly rather
+			// than let the single-commit path silently commit whatever remains
+			// staged under a message describing the full original plan.
+			const postCheckoutFiles = new Set(await git.diff.changedFiles(cwd, { cached: true }));
+			const missing = plan.commits.flatMap(commit => commit.files).filter(file => !postCheckoutFiles.has(file));
+			if (missing.length > 0) {
+				const shown = missing.slice(0, PREVIEW_LIMITS.COLLAPSED_ITEMS).map(file => replaceTabs(file));
+				const suffix = missing.length > shown.length ? `, +${missing.length - shown.length} more` : "";
+				throw new Error(
+					`Switching to ${branch.name} dropped staged changes the plan expected: ${shown.join(", ")}${suffix}. Re-run /commit.`,
+				);
+			}
 		}
 	}
 	const branchName = branch?.name;
@@ -226,19 +242,55 @@ function normalizeBranchSegment(value: string): string {
 export async function createSplitCommits(cwd: string, plan: QuickCommitPlan): Promise<void> {
 	const stagedDiff = await git.diff(cwd, { cached: true, binary: true });
 	await git.stage.reset(cwd);
-	for (const commit of plan.commits) {
-		await git.stage.hunks(
-			cwd,
-			commit.files.map(file => ({ path: file, hunks: { type: "all" } as const })),
-			{ rawDiff: stagedDiff, diffCached: true },
-		);
-		await git.commit(cwd, commit.message);
-		await git.stage.reset(cwd);
+	let committed = 0;
+	try {
+		for (const commit of plan.commits) {
+			await git.stage.hunks(
+				cwd,
+				commit.files.map(file => ({ path: file, hunks: { type: "all" } as const })),
+				{ rawDiff: stagedDiff, diffCached: true },
+			);
+			await git.commit(cwd, commit.message);
+			committed += 1;
+			await git.stage.reset(cwd);
+		}
+	} catch (error) {
+		// A pre-commit hook, signing step, or `git commit` failure here would
+		// otherwise leave every later group unstaged in the working tree and
+		// invisible to a retry's `changedFiles` scan. Restore the original
+		// staged snapshot for every group that hasn't landed a commit yet
+		// (fresh from `stagedDiff` against the current, post-success HEAD) so
+		// the user's original index is recoverable instead of silently
+		// omitted.
+		const remaining = plan.commits.slice(committed);
+		if (remaining.length > 0) {
+			await git.stage.reset(cwd);
+			await git.stage.hunks(
+				cwd,
+				remaining.flatMap(commit => commit.files).map(file => ({ path: file, hunks: { type: "all" } as const })),
+				{ rawDiff: stagedDiff, diffCached: true },
+			);
+		}
+		throw error;
 	}
 }
 
+const CONFIRM_MAX_COMMITS = PREVIEW_LIMITS.COLLAPSED_ITEMS;
+const CONFIRM_MAX_FILES_PER_COMMIT = PREVIEW_LIMITS.COLLAPSED_ITEMS;
+
 function formatSplitPlan(plan: QuickCommitPlan): string {
-	return plan.commits
-		.map((commit, index) => `${index + 1}. ${commit.message.split("\n", 1)[0]}\n   ${commit.files.join(", ")}`)
-		.join("\n\n");
+	const shown = plan.commits.slice(0, CONFIRM_MAX_COMMITS);
+	const lines = shown.map((commit, index) => {
+		const subject = previewLine(commit.message.split("\n", 1)[0], TRUNCATE_LENGTHS.LINE);
+		const files = commit.files
+			.slice(0, CONFIRM_MAX_FILES_PER_COMMIT)
+			.map(file => previewLine(file, TRUNCATE_LENGTHS.SHORT));
+		const omitted = commit.files.length - files.length;
+		const fileList = omitted > 0 ? `${files.join(", ")}, +${omitted} more` : files.join(", ");
+		return `${index + 1}. ${subject}\n   ${fileList}`;
+	});
+	if (plan.commits.length > shown.length) {
+		lines.push(`… +${plan.commits.length - shown.length} more commits`);
+	}
+	return lines.join("\n\n");
 }

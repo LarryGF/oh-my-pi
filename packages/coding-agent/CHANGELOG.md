@@ -13,6 +13,9 @@
 - Session listing now caches parsed headers keyed on file stat identity (mtime + size), so repeated resume-picker opens and startup scans re-read only changed session files
 - Reduced per-keystroke editor dispatch overhead: keybinding resolution happens once per input chunk and the per-action interception chain is gated behind a single canonical-key set probe
 - `xd://` device docs now render the parameter schema as a comment-annotated TypeScript type (via `jsonSchemaToTypeScript`, the same renderer the in-band tool inventory uses) instead of a raw JSON Schema dump, shrinking system-prompt device sections while keeping descriptions inline.
+### Fixed
+
+- Fixed `/commit` split-commit execution silently dropping non-ASCII-named staged files (Git C-quotes diff headers for them) and losing not-yet-committed groups when a pre-commit hook or signing step failed partway through a split; fixed `/commit` rejecting comma-separated Conventional Commit scopes (`feat(catalog,ai): ...`) and failing outright on a repository's first commit (`git log` on an unborn `HEAD`); and gated `/commit` on the session going idle, used the live session cwd instead of one captured at load time, revalidated staged files after switching to an existing protected branch, and derived the commit-planner's output token budget from the staged file count instead of a fixed cap that truncated large plans.
 
 ## [17.1.6] - 2026-07-27
 
