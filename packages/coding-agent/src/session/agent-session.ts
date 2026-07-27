@@ -911,6 +911,7 @@ export class AgentSession {
 		this.#models = new ModelControls(modelControlsHost, {
 			scopedModels: config.scopedModels,
 			thinkingLevel: config.thinkingLevel,
+			thinkingLevelCeiling: config.thinkingLevelCeiling,
 			serviceTierByFamily: config.serviceTierByFamily,
 		});
 
@@ -928,6 +929,7 @@ export class AgentSession {
 			thinkingLevel: () => this.thinkingLevel,
 			configuredThinkingLevel: () => this.configuredThinkingLevel(),
 			setThinkingLevel: level => this.setThinkingLevel(level),
+			thinkingLevelCeiling: () => this.#models.thinkingLevelCeiling,
 			isDisposed: () => this.#isDisposed,
 			isStreaming: () => this.isStreaming,
 			isCompacting: () => this.isCompacting,
@@ -1471,7 +1473,7 @@ export class AgentSession {
 
 		this.#toolChoiceQueue.pushSequence([forced, "none"], {
 			label: "user-force",
-			onRejected: () => "requeue",
+			onRejected: info => (info.reason === "unavailable" ? "drop_sequence" : "requeue"),
 		});
 	}
 
@@ -4222,6 +4224,7 @@ export class AgentSession {
 
 	/** Drop mutable tool decisions and directives owned by the previous logical session. */
 	#clearSessionScopedToolState(): void {
+		this.agent.clearDeferredToolDirectives();
 		this.#toolChoiceQueue.clear();
 		this.#tools.clearAcpPermissionDecisions();
 	}
@@ -5901,6 +5904,10 @@ export class AgentSession {
 				additionalDirectories: this.settings.get("workspace.additionalDirectories"),
 			});
 			this.#bash.markSessionTransition(bashTransition);
+			// The new session owns the transcript from here, so the previous
+			// conversation's advisor spend is retired with it. Clearing at the commit
+			// point keeps the status line honest even if a later step below throws.
+			this.#advisors.clearCost();
 			sessionTransitioned = true;
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
@@ -6323,7 +6330,7 @@ export class AgentSession {
 			activeMessages.splice(0, activeMessages.length, ...sessionContext.messages);
 		}
 		this.agent.replaceMessages(activeMessages ?? sessionContext.messages);
-		this.#advisors.resetSessionState();
+		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 		this.#checkpointState = undefined;
@@ -6941,7 +6948,7 @@ export class AgentSession {
 			}
 
 			this.agent.replaceMessages(sessionContext.messages);
-			this.#advisors.resetSessionState();
+			this.#advisors.resetSessionState({ preserveCost: true });
 			this.#todo.syncFromBranch();
 			if (switchingToDifferentSession) {
 				this.#closeAllProviderSessions("session switch");
@@ -7050,6 +7057,9 @@ export class AgentSession {
 					error: String(refreshErr),
 				});
 			}
+			// Only a committed switch retires the previous conversation's advisor spend:
+			// an earlier clear would be lost work if any step above rolled the switch back.
+			if (switchingToDifferentSession) this.#advisors.clearCost();
 			this.#bash.finishSessionTransition(bashTransition, true);
 			return true;
 		} catch (error) {
@@ -7148,6 +7158,7 @@ export class AgentSession {
 				this.sessionManager.createBranchedSession(selectedEntry.parentId);
 			}
 			this.#bash.markSessionTransition(bashTransition);
+			this.#advisors.clearCost();
 			sessionTransitioned = true;
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
@@ -7245,6 +7256,7 @@ export class AgentSession {
 		try {
 			this.sessionManager.createBranchedSession(leafId);
 			this.#bash.markSessionTransition(bashTransition);
+			this.#advisors.clearCost();
 			sessionTransitioned = true;
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
@@ -7574,7 +7586,7 @@ export class AgentSession {
 		const displayContext = deobfuscateSessionContext(stateContext, this.#obfuscator);
 		this.agent.replaceMessages(displayContext.messages);
 		this.#rehydrateCheckpointRewindState();
-		this.#advisors.resetSessionState();
+		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 
@@ -8204,6 +8216,11 @@ export class AgentSession {
 	 */
 	getAdvisorStatusOverview(): { configured: boolean; advisors: { name: string; status: AdvisorRuntimeStatus }[] } {
 		return this.#advisors.getAdvisorStatusOverview();
+	}
+
+	/** Return cumulative cost recorded for the current session's advisor activity. */
+	getAdvisorCost(): number {
+		return this.#advisors.getAdvisorCost();
 	}
 	/**
 	 * Return structured advisor stats for the status command and TUI panel.
