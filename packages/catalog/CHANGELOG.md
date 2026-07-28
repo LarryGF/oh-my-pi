@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [17.1.8] - 2026-07-28
+
+### Added
+
+- Added `resolveVertexEndpointHost(location)` utility to resolve the correct Vertex AI API endpoint hostnames for global, multi-region, and regional locations.
+
+### Fixed
+
+- Fixed an issue where `calculateCost` under-reported Anthropic cache-write costs by honoring the `usage.cttl` breakdown to correctly price 1-hour retention writes at 2x the base input rate.
+
+## [17.1.7] - 2026-07-27
+
 ### Added
 
 - Added support for moonshotai/Kimi-K3 and kimi-k3-fast models

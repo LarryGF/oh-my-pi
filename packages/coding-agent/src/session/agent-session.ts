@@ -72,6 +72,7 @@ import type {
 	ToolChoice,
 	ToolResultMessage,
 	UsageReport,
+	UserMessage,
 } from "@oh-my-pi/pi-ai";
 import { type Effort, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
@@ -486,6 +487,13 @@ export class AgentSession {
 	readonly #asyncJobManager: AsyncJobManager | undefined;
 	/** Clears this session's owner delivery sink registration; set when a manager + agent id exist. */
 	#unregisterAsyncDeliverySink: (() => void) | undefined;
+	/**
+	 * Async-delivery generation, bumped on every session transition that evicts
+	 * this owner's jobs (see {@link AgentSession.#cancelOwnAsyncJobs}). Stamped
+	 * onto each queued async-result follow-up so a delivery formatted or drained
+	 * across a `/new` is dropped regardless of job-id reuse.
+	 */
+	#asyncDeliveryEpoch = 0;
 
 	readonly #irc: IrcBridge;
 	// Agent identity (registry id) used for IRC routing and job ownership.
@@ -1105,8 +1113,7 @@ export class AgentSession {
 			rebuildSystemPrompt: config.rebuildSystemPrompt,
 			getLocalCalendarDate: config.getLocalCalendarDate,
 			getMcpServerInstructions: config.getMcpServerInstructions,
-			xdevRegistry: config.xdevRegistry,
-			initialMountedXdevToolNames: config.initialMountedXdevToolNames,
+			xdev: config.xdev,
 			setActiveToolNames: config.setActiveToolNames,
 			baseSystemPrompt: this.agent.state.systemPrompt,
 			skills: config.skills,
@@ -1173,7 +1180,7 @@ export class AgentSession {
 				this.#deliverAsyncJobResult(manager, jobId, text, job),
 			);
 			this.yieldQueue.register<AsyncResultEntry>("async-result", {
-				isStale: entry => manager.isDeliverySuppressed(entry.jobId),
+				isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch || manager.isDeliverySuppressed(entry.jobId),
 				build: buildAsyncResultBatchMessage,
 			});
 		}
@@ -1612,7 +1619,9 @@ export class AgentSession {
 	 * transitions (newSession, switchSession, handoff, dispose) so a subagent
 	 * cleans up its own background work without touching its parent's jobs.
 	 *
-	 * Cancellation runs against this session's scoped manager. Subagents have
+	 * Cleanup runs against this session's scoped manager: running jobs are
+	 * cancelled, finished rows are evicted with their pending deliveries, and any
+	 * async-result follow-up already queued for injection is dropped. Subagents have
 	 * unique agent ids and inherit the parent's manager to clean up their own
 	 * jobs. A secondary in-process top-level session gets no scoped manager,
 	 * because it defaults to `MAIN_AGENT_ID`; reaching through the global
@@ -1625,6 +1634,12 @@ export class AgentSession {
 		if (!this.#agentId) return;
 		const manager = this.#asyncJobManager;
 		manager?.cancelAll({ ownerId: this.#agentId });
+		manager?.evictCompletedJobs({ ownerId: this.#agentId });
+		// Invalidate this owner's in-flight/drained deliveries against the new
+		// generation, then drop any async-result follow-up already queued, so a
+		// prior session's background result cannot inject into the next transcript.
+		this.#asyncDeliveryEpoch += 1;
+		this.yieldQueue.clear("async-result");
 	}
 
 	/**
@@ -1690,10 +1705,17 @@ export class AgentSession {
 	async #deliverAsyncJobResult(manager: AsyncJobManager, jobId: string, text: string, job?: AsyncJob): Promise<void> {
 		if (this.#isDisposed) return;
 		if (manager.isDeliverySuppressed(jobId)) return;
+		// Snapshot the generation before the async format step: a `/new` during it
+		// bumps the epoch, so this delivery belongs to the replaced session and
+		// must not enqueue — the suppression marker alone is unreliable because
+		// job-id reuse clears it.
+		const epoch = this.#asyncDeliveryEpoch;
 		const formatted = await this.#formatAsyncResultForFollowUp(text);
+		if (this.#isDisposed) return;
+		if (epoch !== this.#asyncDeliveryEpoch) return;
 		if (manager.isDeliverySuppressed(jobId)) return;
 		const durationMs = job ? Math.max(0, Date.now() - job.startTime) : undefined;
-		this.yieldQueue.enqueue<AsyncResultEntry>("async-result", { jobId, result: formatted, job, durationMs });
+		this.yieldQueue.enqueue<AsyncResultEntry>("async-result", { jobId, result: formatted, job, durationMs, epoch });
 	}
 
 	async #formatAsyncResultForFollowUp(result: string): Promise<string> {
@@ -4565,7 +4587,9 @@ export class AgentSession {
 		return {
 			role: "custom",
 			customType: "vibe-mode-context",
-			content: prompt.render(vibeModeActivePrompt),
+			content: prompt.render(vibeModeActivePrompt, {
+				todoAvailable: this.getActiveToolNames().includes("todo"),
+			}),
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
@@ -7206,10 +7230,12 @@ export class AgentSession {
 	 * @param entryId ID of the entry to branch from
 	 * @returns Object with:
 	 *   - selectedText: The text of the selected user message (for editor pre-fill)
+	 *   - selectedImages: Image attachments of the selected user message (for editor draft restore)
 	 *   - cancelled: True if a hook cancelled the branch
 	 */
 	async branch(entryId: string): Promise<{
 		selectedText: string;
+		selectedImages: ImageContent[];
 		cancelled: boolean;
 	}> {
 		const previousSessionFile = this.sessionFile;
@@ -7220,6 +7246,7 @@ export class AgentSession {
 		}
 
 		const selectedText = this.#extractUserMessageText(selectedEntry.message.content);
+		const selectedImages = this.#extractUserMessageImages(selectedEntry.message.content);
 
 		let skipConversationRestore = false;
 
@@ -7231,7 +7258,7 @@ export class AgentSession {
 			})) as SessionBeforeBranchResult | undefined;
 
 			if (result?.cancel) {
-				return { selectedText, cancelled: true };
+				return { selectedText, selectedImages, cancelled: true };
 			}
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
@@ -7287,7 +7314,7 @@ export class AgentSession {
 			this.#closeCodexProviderSessionsForHistoryRewrite();
 		}
 
-		return { selectedText, cancelled: false };
+		return { selectedText, selectedImages, cancelled: false };
 	}
 
 	async branchFromBtw(
@@ -7402,7 +7429,7 @@ export class AgentSession {
 	 * @param targetId The entry ID to navigate to
 	 * @param options.summarize Whether user wants to summarize abandoned branch
 	 * @param options.customInstructions Custom instructions for summarizer
-	 * @returns Result with editorText (if user message) and cancelled status
+	 * @returns Result with editorText/editorImages (if user message) and cancelled status
 	 */
 	async navigateTree(
 		targetId: string,
@@ -7432,6 +7459,8 @@ export class AgentSession {
 		} = {},
 	): Promise<{
 		editorText?: string;
+		/** Image attachments of the target user message, parallel to the positional `[Image #N]` markers in {@link editorText}. */
+		editorImages?: ImageContent[];
 		cancelled: boolean;
 		aborted?: boolean;
 		summaryEntry?: BranchSummaryEntry;
@@ -7604,6 +7633,7 @@ export class AgentSession {
 		// Determine the new leaf position based on target type
 		let newLeafId: string | null;
 		let editorText: string | undefined;
+		let editorImages: ImageContent[] | undefined;
 		// Set when the second-pass `ask` re-answer branch below actually commits a
 		// new sibling answer — the trigger for resuming the agent afterwards so the
 		// model consumes it, mirroring a live `ask` completion (issue #6483).
@@ -7613,6 +7643,8 @@ export class AgentSession {
 			// User message: leaf = parent (null if root), text goes to editor
 			newLeafId = targetEntry.parentId;
 			editorText = this.#extractUserMessageText(targetEntry.message.content);
+			const targetImages = this.#extractUserMessageImages(targetEntry.message.content);
+			if (targetImages.length > 0) editorImages = targetImages;
 		} else if (targetEntry.type === "custom_message" && targetEntry.customType !== SKILL_PROMPT_MESSAGE_TYPE) {
 			// Custom message: leaf = parent (null if root), text goes to editor
 			newLeafId = targetEntry.parentId;
@@ -7712,6 +7744,7 @@ export class AgentSession {
 			const rawContext = this.sessionManager.buildSessionContext();
 			return {
 				editorText,
+				editorImages,
 				cancelled: false,
 				summaryEntry,
 				sessionContext: rawContext,
@@ -7720,6 +7753,7 @@ export class AgentSession {
 		}
 		return {
 			editorText,
+			editorImages,
 			cancelled: false,
 			summaryEntry,
 			sessionContext: stateContext,
@@ -7836,6 +7870,14 @@ export class AgentSession {
 				.join("");
 		}
 		return "";
+	}
+
+	/** Image parts of a stored user message, in submission order — index N-1 backs the
+	 *  `[Image #N]` marker in the message text, so restoring them alongside the text keeps
+	 *  positional markers resolvable on resubmit. */
+	#extractUserMessageImages(content: UserMessage["content"]): ImageContent[] {
+		if (!Array.isArray(content)) return [];
+		return content.filter((c): c is ImageContent => c.type === "image");
 	}
 
 	/**

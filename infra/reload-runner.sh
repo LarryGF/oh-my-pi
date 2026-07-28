@@ -34,7 +34,7 @@
 #   BUILDKIT_VERSION         BuildKit release to bootstrap on demand       [0.25.1]
 #   RUNNER_MAX_RUNNERS       maximum concurrent Kata runner pods             [4]
 #   RUNNER_CPU               requested and limited CPU cores per runner       [8]
-#   RUNNER_MEMORY            requested and limited memory per runner          [12Gi]
+#   RUNNER_MEMORY            requested and limited memory per runner          [24Gi]
 set -euo pipefail
 
 : "${CI_HOST:?set CI_HOST to the ssh target of your CI host, e.g. CI_HOST=my-ci-host}"
@@ -50,7 +50,7 @@ NERDCTL_VERSION="${NERDCTL_VERSION:-2.1.6}"
 BUILDKIT_VERSION="${BUILDKIT_VERSION:-0.25.1}"
 RUNNER_MAX_RUNNERS="${RUNNER_MAX_RUNNERS:-4}"
 RUNNER_CPU="${RUNNER_CPU:-8}"
-RUNNER_MEMORY="${RUNNER_MEMORY:-12Gi}"
+RUNNER_MEMORY="${RUNNER_MEMORY:-24Gi}"
 
 arg="${1:-$(date +%Y-%m-%d-%H%M%S)}"
 case "$arg" in *:*) IMAGE="$arg";; *) IMAGE="omp-kata-runner:$arg";; esac
@@ -59,7 +59,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$here/runner.Dockerfile" ] || { echo "no runner.Dockerfile next to $0" >&2; exit 1; }
 
 echo "==> [0/5] copying Dockerfile to ${CI_HOST}:${REMOTE_CTX}"
-ssh "$CI_HOST" "mkdir -p '$REMOTE_CTX'"
+ssh "$CI_HOST" bash -s -- "$REMOTE_CTX" <<'REMOTE'
+mkdir -p "$1"
+REMOTE
 scp -q "$here/runner.Dockerfile" "${CI_HOST}:${REMOTE_CTX}/Dockerfile"
 
 # All build/import/rollout steps run on the host. Config is passed as positional
