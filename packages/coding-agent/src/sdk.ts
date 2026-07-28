@@ -1682,6 +1682,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getModelString: () => (hasExplicitModel && model ? formatModelString(model) : undefined),
 			getActiveModelString,
 			getActiveModel: () => agent?.state.model ?? model,
+			getInspectImageModeOverride: () => session?.getInspectImageModeOverride(),
 			getServiceTierByFamily: () => session?.serviceTierByFamily,
 			getImageAttachments: () => session?.getImageAttachments() ?? [],
 			getPlanModeState: () => session?.getPlanModeState(),
@@ -3111,6 +3112,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return id ? `${id}-advisor` : null;
 			},
 			getAgentId: () => "advisor",
+			// The primary's availability signals are wrong for advisors: their tool
+			// slate is filtered separately at runtime (default read/grep/glob, no
+			// write transport), so xd:// devices are unreachable and read must never
+			// advertise inspect_image — images are inlined, and the provider
+			// boundary handles text-only advisor models.
+			xdevRegistry: undefined,
+			isToolActive: name => name !== "inspect_image" && toolSession.isToolActive?.(name) === true,
 		};
 		const advisorToolBuilds: Array<Tool | null | Promise<Tool | null>> = [];
 		for (const name in BUILTIN_TOOLS) {
@@ -3178,6 +3186,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			createComputerTool: restrictToolNames
 				? undefined
 				: async () => (await BUILTIN_TOOLS.computer(toolSession)) ?? null,
+			createInspectImageTool: restrictToolNames
+				? undefined
+				: async () => (await BUILTIN_TOOLS.inspect_image(toolSession)) ?? null,
 			createVibeTools:
 				(options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix
 					? () => createVibeTools(toolSession)
